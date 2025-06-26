@@ -50,7 +50,18 @@
 //#define MAX_CD1_LEN               ((MAX_SIG_LEN_SIZE >> 1) + 1) /* Detail coefficients for level 1 are calculated by folding signals in half. */
 #define ABS(_x)                   ((_x < 0) ? (0 - _x) : (_x))
 
-bool tap_detect_status(const int *mic1_sig, const int *mic2_sig, int audio_sig_len);
+#define TAP_INTERVAL_MS           (300) /* measured in recordings. */
+#define TAP_INTERVAL_SAMPLES      (TAP_INTERVAL_MS * 48) /* 48KHz sampling rate */
+#define TAP_INTERVAL_BLOCKS       ((TAP_INTERVAL_SAMPLES + MAX_AUDIO_FRAME_SIZE - 1)/MAX_AUDIO_FRAME_SIZE)
+
+typedef enum
+{
+    TAP_NONE = 0,
+    TAP_SINGLE = 1 << 8,
+    TAP_DOUBLE = 1 << 16
+} tap_detection_result_e;
+
+tap_detection_result_e tap_detect_status(const int *mic1_sig, const int *mic2_sig, int audio_sig_len);
 
 
 #endif // !TAP_DETECT_H

@@ -1,21 +1,60 @@
 #include <stdio.h>    // For console I/O (printf, fprintf)
 #include <stdlib.h>   // For memory allocation (malloc, free), random numbers (rand, srand)
 #include <stdint.h>   // For fixed-size integer types (uint32_t, int16_t, int32_t, int64_t)
-#include <string.h>   // For memcpy (to copy frames)
-#include <math.h>     // For fabsf
-#include "tap_detect.h"
+#include <string.h>   // For strncpy
+#include <math.h>     // For round()
+#include <limits.h>   // For INT16_MAX, INT16_MIN, INT32_MAX, INT32_MIN
+#include <time.h>     // For time() to seed random number generator
 
-// Define M_PI if it's not defined by default (some compilers might require _USE_MATH_DEFINES)
-#ifndef M_PI
-#define M_PI 3.14159265358979323846f
-#endif
+#include "tap_detect.h" // Include the custom tap detection header
 
+// --- Fixed-Point Configuration ---
+// We'll use Q2.29 fixed-point format for 32-bit processing.
+// This means: 1 sign bit, 2 integer bits, 29 fractional bits.
+// The value range for a Q2.29 fixed_point_t (int32_t) is approximately -4.0 to +3.999...
+// This provides sufficient headroom for audio processing (audio typically normalized to -1.0 to 1.0).
+#define Q_FORMAT Q_BITS // Using Q_BITS from tap_detect.h for consistency (29)
+#define FIXED_POINT_ONE Q_ONE // Using Q_ONE from tap_detect.h for consistency (1 << 29)
 
+// Define the fixed_point_t type as a signed 32-bit integer for processing
+typedef int32_t fixed_point_t;
 
-// --- REMOVED: Minimum floor for transient normalization ---
-// This parameter is no longer needed with absolute thresholding.
-// #define MIN_TRANSIENT_NORMALIZATION_FLOOR_F 0.005f
+// --- Fixed-Point Utility Functions ---
+// Convert a float to fixed-point (Q_FORMAT)
+fixed_point_t float_to_fixed_point(float f) {
+    // Clamp the float value to prevent overflow for Q2.29 range [-4.0, 3.999...]
+    if (f >= 4.0f) f = 3.999999f;
+    if (f < -4.0f) f = -4.0f;
+    return (fixed_point_t)round(f * FIXED_POINT_ONE);
+}
 
+// Convert fixed-point (Q_FORMAT) to float
+float fixed_point_to_float(fixed_point_t q) {
+    return (float)q / FIXED_POINT_ONE;
+}
+
+// Fixed-point multiplication (Q_FORMAT * Q_FORMAT -> Q_FORMAT)
+fixed_point_t fixed_point_mul(fixed_point_t a, fixed_point_t b) {
+    // Multiply two 32-bit numbers, result can be up to 64-bit.
+    int64_t result_64 = (int64_t)a * b;
+    // Right-shift by Q_FORMAT to bring it back to Q_FORMAT.
+    // This implicitly truncates fractional bits beyond Q_FORMAT.
+    return (fixed_point_t)(result_64 >> Q_FORMAT);
+}
+
+// Fixed-point addition (Q_FORMAT + Q_FORMAT -> Q_FORMAT) with saturation
+fixed_point_t fixed_point_add(fixed_point_t a, fixed_point_t b) {
+    // Use a 64-bit temporary variable to detect overflow before casting back to 32-bit.
+    int64_t sum = (int64_t)a + b;
+
+    // Saturate the sum to the valid range of fixed_point_t (int32_t)
+    if (sum > INT32_MAX) {
+        return INT32_MAX;
+    } else if (sum < INT32_MIN) {
+        return INT32_MIN;
+    }
+    return (fixed_point_t)sum;
+}
 
 // --- WAV Header Structure ---
 // Defines the standard RIFF WAV file header for 16-bit PCM mono audio.
@@ -36,7 +75,7 @@ typedef struct {
 } WavHeader;
 
 /**
- * @brief Reads 16-bit PCM mono audio data from a WAV file into a dynamically allocated fixed-point array.
+ * @brief Reads 16-bit PCM mono audio data from a WAV file into a dynamically allocated fixed-point array (Q2.29).
  * @param filepath The path to the input WAV file.
  * @param samplerate_out Pointer to a uint32_t to store the sample rate read from the header.
  * @param num_samples_out Pointer to a long to store the total number of audio samples read.
@@ -44,7 +83,7 @@ typedef struct {
  * or NULL if an error occurs. The caller is responsible for freeing this memory.
  * Assumptions: Input WAV is 16-bit PCM, mono.
  */
-int32_t* read_wav_data_fx(const char* filepath, uint32_t* samplerate_out, long* num_samples_out) {
+fixed_point_t* read_wav_data_fx(const char* filepath, uint32_t* samplerate_out, long* num_samples_out) {
     FILE* file = fopen(filepath, "rb");
     if (!file) {
         fprintf(stderr, "Error: Could not open WAV file %s\n", filepath);
@@ -70,7 +109,7 @@ int32_t* read_wav_data_fx(const char* filepath, uint32_t* samplerate_out, long* 
     *samplerate_out = header.sample_rate;
     *num_samples_out = header.data_size / (header.bits_per_sample / 8);
 
-    int32_t* audio_data_fx = (int32_t*)malloc(*num_samples_out * sizeof(int32_t));
+    fixed_point_t* audio_data_fx = (fixed_point_t*)malloc(*num_samples_out * sizeof(fixed_point_t));
     if (!audio_data_fx) {
         fprintf(stderr, "Error: Memory allocation failed for fixed-point audio data.\n");
         fclose(file);
@@ -85,10 +124,9 @@ int32_t* read_wav_data_fx(const char* filepath, uint32_t* samplerate_out, long* 
              fclose(file);
              return NULL;
         }
-        // Convert int16_t sample to Q2.29 fixed-point.
-        // int16_t ranges from -32768 to +32767. Q2.29 has 29 fractional bits.
-        // To convert Q0.15 (16-bit int) to Q2.29, we shift left by (29 - 15) = 14 bits.
-        audio_data_fx[i] = ((int32_t)sample_int << (Q_BITS - 15));
+        // Convert int16_t sample (Q0.15) to Q2.29 fixed-point.
+        // Shift left by (Q_FORMAT - 15) = (29 - 15) = 14 bits.
+        audio_data_fx[i] = ((fixed_point_t)sample_int << (Q_FORMAT - 15));
     }
 
     fclose(file);
@@ -103,7 +141,7 @@ int32_t* read_wav_data_fx(const char* filepath, uint32_t* samplerate_out, long* 
  * @param samplerate The sample rate of the audio in Hz.
  * Assumptions: Output WAV will be 16-bit PCM, mono.
  */
-void write_wav_data_fx(const char* filepath, const int32_t* audio_data_fx, long num_samples, uint32_t samplerate) {
+void write_wav_data_fx(const char* filepath, const fixed_point_t* audio_data_fx, long num_samples, uint32_t samplerate) {
     FILE* file = fopen(filepath, "wb");
     if (!file) {
         fprintf(stderr, "Error: Could not open file for writing %s\n", filepath);
@@ -134,12 +172,14 @@ void write_wav_data_fx(const char* filepath, const int32_t* audio_data_fx, long 
     // Convert fixed-point samples back to 16-bit integers and write them
     int16_t sample_int;
     for (long i = 0; i < num_samples; ++i) {
-        // Convert Q2.29 to Q0.15 (16-bit signed int) by shifting right by (29-15) = 14 bits.
-        // Then clip to [-32768, 32767] range of int16_t.
-        sample_int = (int16_t)(audio_data_fx[i] >> (Q_BITS - 15));
-        // Manual clipping to int16_t min/max for robustness, though FX_CLIP should handle overall.
-        if (sample_int > 32767) sample_int = 32767;
-        if (sample_int < -32768) sample_int = -32768;
+        // Convert Q2.29 fixed-point to 16-bit signed int (Q0.15)
+        // Shift right by (Q_FORMAT - 15) = (29 - 15) = 14 bits.
+        int32_t temp_val = audio_data_fx[i] >> (Q_FORMAT - 15);
+
+        // Clip to [-32768, 32767] range of int16_t.
+        if (temp_val > INT16_MAX) sample_int = INT16_MAX;
+        else if (temp_val < INT16_MIN) sample_int = INT16_MIN;
+        else sample_int = (int16_t)temp_val;
 
         fwrite(&sample_int, sizeof(int16_t), 1, file);
     }
@@ -149,9 +189,12 @@ void write_wav_data_fx(const char* filepath, const int32_t* audio_data_fx, long 
 
 // --- Main application function ---
 // This main function demonstrates how to process a WAV file frame by frame for tap detection.
-// Compile: gcc your_file.c -o tap_detector -lm
+// Compile: gcc audio_processor.c tap_detect.c -o tap_detector -lm
 // Run: ./tap_detector input_audio.wav
 int main(int argc, char *argv[]) {
+    // Seed the random number generator for the dummy tap detector
+    srand(time(NULL));
+
     // Check command line arguments
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <input_wav_file>\n", argv[0]);
@@ -163,16 +206,15 @@ int main(int argc, char *argv[]) {
     uint32_t samplerate;
     long total_num_samples;
     // Read the entire WAV file into a dynamically allocated buffer.
-    // In a true embedded system, this data would come from an ADC stream.
-    int32_t* full_audio_data = read_wav_data_fx(input_wav_filepath, &samplerate, &total_num_samples);
+    fixed_point_t* full_audio_data = read_wav_data_fx(input_wav_filepath, &samplerate, &total_num_samples);
     if (!full_audio_data) {
         fprintf(stderr, "Failed to load audio from %s. Exiting.\n", input_wav_filepath);
         return 1;
     }
 
     // Dynamically allocate a buffer for the binary tap detection output signal.
-    // This buffer will be filled with Q_ONE (1.0) or 0 based on detection.
-    int32_t* tap_detection_output_fx = (int32_t*)calloc(total_num_samples, sizeof(int32_t));
+    // This buffer will be filled with Q_ONE (1.0), Q_ONE/2 (0.5), or 0 based on detection.
+    fixed_point_t* tap_detection_output_fx = (fixed_point_t*)calloc(total_num_samples, sizeof(fixed_point_t));
     if (!tap_detection_output_fx) {
         fprintf(stderr, "Error: Memory allocation failed for tap_detection_output_fx buffer.\n");
         free(full_audio_data);
@@ -182,17 +224,16 @@ int main(int argc, char *argv[]) {
     printf("Processing WAV file: %s (Samplerate: %u Hz, Total Samples: %ld)\n",
            input_wav_filepath, samplerate, total_num_samples);
     printf("--- Tap Detection Log by Frame ---\n");
+    // MAX_AUDIO_FRAME_SIZE should be defined in tap_detect.h, assuming a value for now if not present.
+    // If MAX_AUDIO_FRAME_SIZE is not defined in tap_detect.h, please add it there.
+    // For this example, let's assume a default if it's not available yet.
+    #ifndef MAX_AUDIO_FRAME_SIZE
+    #define MAX_AUDIO_FRAME_SIZE 256 // Default frame size if not defined in tap_detect.h
+    #endif
     printf("Frame Size: %d samples\n", MAX_AUDIO_FRAME_SIZE);
-    // Removed normalization floor log as it's no longer used.
     printf("----------------------------------\n");
     printf("Frame | Start Time (s) | Tap Detected?\n");
     printf("----------------------------------\n");
-
-    // Parameters for tap detection (tune these for your specific taps and noise)
-    // This is now an ABSOLUTE threshold. Tune it carefully based on expected tap amplitude.
-    // A value of 0.1 means 10%% of full scale.
-    float absolute_transient_threshold = 0.03f;
-    float min_peak_distance_s = 0.03f;       // Minimum separation in seconds
 
     long frame_count = 0;
     // Iterate through the full audio data in chunks (frames)
@@ -203,33 +244,35 @@ int main(int argc, char *argv[]) {
             current_frame_len = total_num_samples - current_sample_idx;
         }
 
-        // Check if the remaining frame is too small for DWT (needs at least 2 samples).
-        if (current_frame_len < 2) {
+        // Check if the remaining frame is too small
+        if (current_frame_len < 2) { // Need at least 2 samples for DWT in a real scenario
             break;
         }
 
         // Call the tap detection function for the current frame
-        /*int tap_detected_in_this_frame = detect_single_tap_binary_for_frame(
-            &full_audio_data[current_sample_idx], // Pointer to the start of the current frame
-            current_frame_len,                   // Actual length of the current frame
-            samplerate,
-            absolute_transient_threshold, // Pass the absolute threshold
-            min_peak_distance_s
-        );*/
-        bool tap_detected_in_this_frame = tap_detect_status(&full_audio_data[current_sample_idx],
-                                                            &full_audio_data[current_sample_idx],
-                                                            current_frame_len);
+        tap_detection_result_e tap_detected_in_this_frame = tap_detect_status(
+                                                                &full_audio_data[current_sample_idx],
+                                                                &full_audio_data[current_sample_idx], // Dummy: second arg (processed_frame_out) not used by dummy
+                                                                current_frame_len);
 
         // Log the result for the current frame
-        printf("%5ld | %14.3f | %s\n",
+        printf("%5ld | %14.3f | %d\n",
                frame_count++,
                (float)current_sample_idx / samplerate,
-               (tap_detected_in_this_frame) ? "YES" : "NO");
+               tap_detected_in_this_frame);
 
-        // Fill the output binary WAV buffer for this frame
-        int32_t fill_value = tap_detected_in_this_frame ? Q_ONE : 0;
+        // Fill the output binary WAV buffer for this frame based on the enum result
+        fixed_point_t mapped_fill_value = 0; // Default to NO_TAP (0)
+        if (tap_detected_in_this_frame == TAP_SINGLE) {
+            mapped_fill_value = 1 << 16; // Represents 0.5 (half full scale)
+        } else if (tap_detected_in_this_frame == TAP_DOUBLE) {
+            mapped_fill_value = 1 << 31; // Represents 1.0 (full scale)
+        }
+        // You can use different mapping for other enum values if you extend it
+        // else if (tap_detected_in_this_frame == TRIPLE_TAP) { ... }
+
         for (long i = 0; i < current_frame_len; ++i) {
-            tap_detection_output_fx[current_sample_idx + i] = fill_value;
+            tap_detection_output_fx[current_sample_idx + i] = mapped_fill_value;
         }
     }
     printf("----------------------------------\n");
